@@ -1,9 +1,12 @@
 package pool
 
 import (
+	"context"
 	"errors"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -17,30 +20,66 @@ type Pool struct {
 	waiting     int32 // 等待数量
 	Closed      int32
 	lock        sync.Mutex
-	container   workersContainer
+	works       workersContainer
 	workerCache sync.Pool
 	cfg         *PoolConfig
-	cond        sync.Cond
-}
-type PoolConfig struct {
+	cond        *sync.Cond
+	config      *PoolConfig
 }
 
-func NewPool() *Pool {
+func NewPool(cap int) *Pool {
+	if cap <= 0 {
+		panic("not equal 0")
+	}
 	p := &Pool{
 		workerCache: sync.Pool{
 			New: func() any {
 				return newGoWorker()
 			},
 		},
+		capacity: cap,
+		works:    newWorkerLoopQueue(cap),
+		config: &PoolConfig{
+			ExpireDuration: 10,
+		},
 	}
-	go p.CleanPeriodically()
+	p.cond = sync.NewCond(&p.lock)
+	go p.CleanPeriodically(context.Background())
+	go p.Monitor()
 	return p
 }
 
-func (p *Pool) CleanPeriodically() {
+func (p *Pool) CleanPeriodically(ctx context.Context) {
+	timer := time.NewTicker(time.Duration(p.config.ExpireDuration) * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+		case now := <-timer.C:
+			if p.IsClosed() {
+				return
+			}
+			p.lock.Lock()
+			expires := p.works.getExpires(now.Unix() - int64(p.config.ExpireDuration))
+			p.lock.Unlock()
+			if len(expires) > 0 {
+				log.Printf("CleanPeriodically nums:%v", len(expires))
+			}
 
+			for _, v := range expires {
+				v.task <- nil
+			}
+
+			if p.Running() == 0 || (p.Waiting() > 0 && p.Free() > 0) {
+				p.cond.Broadcast()
+			}
+		}
+
+	}
 }
-
+func (p *Pool) Waiting() int {
+	return int(atomic.LoadInt32(&p.waiting))
+}
 func (p *Pool) Running() int {
 	return int(atomic.LoadInt32(&p.running))
 }
@@ -50,7 +89,7 @@ func (p *Pool) Submit(task func()) error {
 		return ErrClosed
 	}
 	w := p.getWorker()
-	if w != nil {
+	if w == nil {
 		return ErrOverLoad
 	}
 	w.task <- task
@@ -58,7 +97,11 @@ func (p *Pool) Submit(task func()) error {
 }
 
 func (p *Pool) Free() int {
-
+	c := p.Cap()
+	if c < 0 {
+		return -1
+	}
+	return c - p.Running()
 }
 
 func (p *Pool) Cap() int {
@@ -72,10 +115,11 @@ func (p *Pool) IsClosed() bool {
 func (p *Pool) getWorker() (worker *goWorker) {
 	spawnWorker := func() {
 		worker = p.workerCache.Get().(*goWorker)
+		worker.pool = p
 		go worker.Run()
 	}
 	p.lock.Lock()
-	w := p.container.pop()
+	w := p.works.pop()
 	if w != nil {
 		p.lock.Unlock()
 		return
@@ -91,6 +135,7 @@ Retry:
 	p.addWaiting(1)
 	p.cond.Wait()
 	p.addWaiting(-1)
+
 	if p.IsClosed() {
 		p.lock.Unlock()
 		return
@@ -101,7 +146,7 @@ Retry:
 		spawnWorker()
 		return
 	}
-	if worker := p.container.pop(); worker == nil {
+	if worker = p.works.pop(); worker == nil {
 		if nw < p.Cap() {
 			p.lock.Unlock()
 			spawnWorker()
@@ -114,7 +159,21 @@ Retry:
 }
 
 func (p *Pool) PutWorker(worker *goWorker) bool {
-
+	if (p.Waiting() != 0 && p.Free() > 0) || p.Running() == 0 || p.IsClosed() {
+		p.cond.Broadcast()
+	}
+	worker.recycleTime = time.Now().Unix()
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.IsClosed() {
+		return false
+	}
+	err := p.works.offer(worker)
+	if err != nil {
+		log.Printf("error:%v ", err)
+		return false
+	}
+	p.cond.Signal()
 	return true
 }
 
@@ -124,4 +183,20 @@ func (p *Pool) addRunning(num int32) {
 
 func (p *Pool) addWaiting(num int32) {
 	atomic.AddInt32(&p.waiting, num)
+}
+
+func (p *Pool) Monitor() {
+	timer := time.NewTicker(1 * time.Second)
+	defer timer.Stop()
+	for {
+		if p.IsClosed() {
+			return
+		}
+		select {
+		case <-timer.C:
+			log.Printf("waiters:%v   running:%v   ", p.Waiting(), p.Running())
+		}
+
+	}
+
 }

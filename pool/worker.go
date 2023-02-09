@@ -1,7 +1,7 @@
 package pool
 
 import (
-	"time"
+	"log"
 )
 
 type workersContainer interface {
@@ -9,14 +9,14 @@ type workersContainer interface {
 	isEmpty() bool
 	offer(worker *goWorker) error
 	pop() *goWorker
-	getExpires(duration time.Duration) []*goWorker
+	getExpires(expireTime int64) []*goWorker
 	clean()
 }
 
 type goWorker struct {
-	pool        Pool
+	pool        *Pool
 	task        chan func()
-	recycleTime time.Time
+	recycleTime int64
 }
 
 func newGoWorker() *goWorker {
@@ -37,6 +37,7 @@ func (g *goWorker) Run() {
 		}()
 		for task := range g.task {
 			if task == nil {
+				log.Printf("task go away")
 				return
 			}
 			task()
