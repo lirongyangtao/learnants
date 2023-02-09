@@ -122,6 +122,7 @@ func (p *Pool) getWorker() (worker *goWorker) {
 	w := p.works.pop()
 	if w != nil {
 		p.lock.Unlock()
+		w = worker
 		return
 	}
 Retry:
